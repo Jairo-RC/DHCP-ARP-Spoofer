@@ -262,7 +262,7 @@ class DHCPSpooferApp(ctk.CTk):
             return
 
         try:
-            cmd = [YERSINIA_BIN, "-attack", DHCP_ATTACK_ID, "-interface", iface, "dhcp"]
+            cmd = [YERSINIA_BIN, "dhcp", "-attack", DHCP_ATTACK_ID, "-interface", iface]
             self._process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,

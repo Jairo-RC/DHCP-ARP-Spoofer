@@ -41,7 +41,7 @@ ctk.set_default_color_theme("blue")
 # Constants
 # ---------------------------------------------------------------------------
 WINDOW_WIDTH: int = 600
-WINDOW_HEIGHT: int = 550
+WINDOW_HEIGHT: int = 680
 YERSINIA_BIN: str = "yersinia"
 DHCP_ATTACK_ID: str = "1"  # Yersinia DHCP attack mode 1 (sending DISCOVER)
 
@@ -60,6 +60,11 @@ def is_root() -> bool:
 def yersinia_installed() -> bool:
     """Check whether Yersinia is available in PATH."""
     return shutil.which(YERSINIA_BIN) is not None
+
+
+def tcpdump_installed() -> bool:
+    """Check whether tcpdump is available in PATH."""
+    return shutil.which("tcpdump") is not None
 
 
 def get_network_interfaces() -> list[str]:
@@ -97,7 +102,10 @@ class DHCPSpooferApp(ctk.CTk):
 
         # ── State ─────────────────────────────────────────────────────────
         self._process: Optional[subprocess.Popen] = None
+        self._sniffer_process: Optional[subprocess.Popen] = None
         self._output_thread: Optional[threading.Thread] = None
+        self._sniffer_thread: Optional[threading.Thread] = None
+        self._packet_count: int = 0
 
         # ── Build UI ──────────────────────────────────────────────────────
         self._build_ui()
@@ -123,11 +131,15 @@ class DHCPSpooferApp(ctk.CTk):
 
         root_ok = is_root()
         yers_ok = yersinia_installed()
+        tcpdump_ok = tcpdump_installed()
 
         root_icon = "✅" if root_ok else "❌"
         yers_icon = "✅" if yers_ok else "❌"
+        tcpdump_icon = "✅" if tcpdump_ok else "❌"
+        
         root_color = "#27ae60" if root_ok else "#e74c3c"
         yers_color = "#27ae60" if yers_ok else "#e74c3c"
+        tcpdump_color = "#27ae60" if tcpdump_ok else "#e74c3c"
 
         ctk.CTkLabel(
             checks_frame, text=f"{root_icon}  Root privileges",
@@ -137,6 +149,11 @@ class DHCPSpooferApp(ctk.CTk):
         ctk.CTkLabel(
             checks_frame, text=f"{yers_icon}  Yersinia installed",
             font=("Segoe UI", 12), text_color=yers_color,
+        ).pack(pady=(2, 2), padx=15, anchor="w")
+
+        ctk.CTkLabel(
+            checks_frame, text=f"{tcpdump_icon}  tcpdump installed",
+            font=("Segoe UI", 12), text_color=tcpdump_color,
         ).pack(pady=(2, 8), padx=15, anchor="w")
 
         # ── Interface selector ────────────────────────────────────────────
@@ -163,7 +180,7 @@ class DHCPSpooferApp(ctk.CTk):
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
         btn_frame.pack(padx=20, pady=8, fill="x")
 
-        can_attack = root_ok and yers_ok and bool(interfaces)
+        can_attack = root_ok and yers_ok and tcpdump_ok and bool(interfaces)
 
         self._start_btn = ctk.CTkButton(
             btn_frame, text="⚡  Start Attack",
@@ -183,15 +200,25 @@ class DHCPSpooferApp(ctk.CTk):
         )
         self._stop_btn.pack(side="left", expand=True, fill="x", padx=(5, 0))
 
-        # ── Status indicator ──────────────────────────────────────────────
+        # ── Status indicator & Counter ────────────────────────────────────
         self._status_frame = ctk.CTkFrame(self, fg_color="#1a1a2e", corner_radius=8)
         self._status_frame.pack(padx=20, pady=5, fill="x")
+        
+        # Create a grid inside status frame
+        self._status_frame.grid_columnconfigure(0, weight=1)
+        self._status_frame.grid_columnconfigure(1, weight=1)
 
         self._status_label = ctk.CTkLabel(
             self._status_frame, text="🟢  Idle — Ready to attack",
             font=("Segoe UI", 13), text_color="#aaaaaa",
         )
-        self._status_label.pack(pady=10, padx=15)
+        self._status_label.grid(row=0, column=0, pady=15, padx=15, sticky="w")
+        
+        self._counter_label = ctk.CTkLabel(
+            self._status_frame, text="0 PKTS",
+            font=("Segoe UI", 24, "bold"), text_color="#00ff88",
+        )
+        self._counter_label.grid(row=0, column=1, pady=15, padx=15, sticky="e")
 
         # ── Output log ───────────────────────────────────────────────────
         ctk.CTkLabel(
@@ -260,6 +287,8 @@ class DHCPSpooferApp(ctk.CTk):
         self._start_btn.configure(state="disabled")
         self._stop_btn.configure(state="normal")
         self._iface_menu.configure(state="disabled")
+        self._packet_count = 0
+        self._counter_label.configure(text="0 PKTS")
 
         self._append_log(f"[*] DHCP Starvation started on {iface}\n")
         self._append_log(f"[*] Yersinia PID: {self._process.pid}\n")
@@ -270,6 +299,40 @@ class DHCPSpooferApp(ctk.CTk):
             target=self._stream_output, daemon=True,
         )
         self._output_thread.start()
+        
+        # Start tcpdump sniffer
+        try:
+            self._sniffer_process = subprocess.Popen(
+                ["tcpdump", "-i", iface, "-n", "-l", "udp", "port", "67", "or", "port", "68"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True
+            )
+            self._sniffer_thread = threading.Thread(
+                target=self._sniff_packets, daemon=True,
+            )
+            self._sniffer_thread.start()
+            self._append_log("[*] Packet sniffer started successfully.\n")
+        except Exception as exc:
+            logger.error("Failed to start tcpdump: %s", exc)
+            self._append_log(f"[ERROR] Failed to start packet sniffer: {exc}\n")
+
+    def _sniff_packets(self) -> None:
+        """Read tcpdump output and update the packet counter."""
+        if self._sniffer_process is None or self._sniffer_process.stdout is None:
+            return
+            
+        try:
+            for line in iter(self._sniffer_process.stdout.readline, ""):
+                if line:
+                    self._packet_count += 1
+                    self.after(0, self._update_counter)
+        except Exception as exc:
+            logger.error("Sniffer stream error: %s", exc)
+            
+    def _update_counter(self) -> None:
+        """Update the packet counter label in the GUI."""
+        self._counter_label.configure(text=f"{self._packet_count} PKTS")
 
     def _stream_output(self) -> None:
         """Read Yersinia stdout and append to the log (runs in background)."""
@@ -314,6 +377,17 @@ class DHCPSpooferApp(ctk.CTk):
         except Exception as exc:
             logger.error("Error stopping process: %s", exc)
             self._append_log(f"[ERROR] Could not stop process: {exc}\n")
+            
+        if self._sniffer_process is not None:
+            try:
+                self._sniffer_process.terminate()
+                self._sniffer_process.wait(timeout=2)
+            except Exception:
+                try:
+                    self._sniffer_process.kill()
+                except Exception:
+                    pass
+            self._sniffer_process = None
 
         self._process = None
         self._set_idle_state()
@@ -344,6 +418,13 @@ class DHCPSpooferApp(ctk.CTk):
                     self._process.kill()
                 except Exception:
                     pass
+                    
+        if self._sniffer_process is not None:
+            try:
+                self._sniffer_process.terminate()
+            except Exception:
+                pass
+                
         self.destroy()
 
 
@@ -362,6 +443,12 @@ def main() -> None:
         logger.error("Yersinia is not installed.")
         print("\n[!] ERROR: Yersinia is not installed or not in PATH.")
         print("    Install: sudo apt install yersinia\n")
+        sys.exit(1)
+
+    if not shutil.which("tcpdump"):
+        logger.error("tcpdump is not installed.")
+        print("\n[!] ERROR: tcpdump is not installed or not in PATH.")
+        print("    Install: sudo apt install tcpdump\n")
         sys.exit(1)
 
     logger.info("DHCP Spoofer started.")
